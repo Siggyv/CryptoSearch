@@ -7,6 +7,8 @@ import torch.multiprocessing as mp
 from web3 import Web3
 from dotenv import load_dotenv
 import argparse
+import time
+import requests
 
 # Load environment variables from .env file
 load_dotenv()
@@ -23,12 +25,21 @@ if not INFURA_API_KEY:
     print('INFURA_API_KEY="your_api_key_here"')
     INFURA_API_KEY = input("Or enter your Infura API key now: ")
 
-# Connect to Ethereum mainnet
-w3 = Web3(Web3.HTTPProvider(f"https://mainnet.infura.io/v3/{INFURA_API_KEY}"))
+# --- Debugging line added ---
+print(f"Attempting to connect with Infura API Key: {INFURA_API_KEY}")
+# --- End debugging line ---
 
-# Check if connection is successful
-if not w3.is_connected():
-    print("Failed to connect to Ethereum node. Please check your API key and internet connection.")
+# Connect to Ethereum mainnet with proper error handling
+try:
+    w3 = Web3(Web3.HTTPProvider(f"https://mainnet.infura.io/v3/{INFURA_API_KEY}"))
+    
+    # Test connection with a simple call
+    current_block = w3.eth.block_number
+    print(f"Connected to Ethereum network. Current block number: {current_block}")
+except Exception as e:
+    print(f"Error connecting to Infura API: {e}")
+    print("Please check your API key and internet connection.")
+    print("The exact error might indicate if your API key is invalid or if there's a rate limit issue.")
     exit(1)
 
 print(f"Connected to Ethereum network. Current block number: {w3.eth.block_number}")
@@ -79,6 +90,7 @@ def validate_date(date_str):
 def process_block(args):
     """
     Process a single block to find transactions related to an address
+    Includes basic rate limiting (retry on 429 error)
     
     Parameters:
     args (tuple): Tuple containing (block_number, address, infura_key)
@@ -87,35 +99,53 @@ def process_block(args):
     list: Transactions in this block involving the address
     """
     block_number, address, infura_key = args
+    max_retries = 3
+    retry_delay = 1 # seconds
     
     # Each process needs its own Web3 connection
     local_w3 = Web3(Web3.HTTPProvider(f"https://mainnet.infura.io/v3/{infura_key}"))
     
-    try:
-        block = local_w3.eth.get_block(block_number, full_transactions=True)
-        result = []
-        
-        for tx in block.transactions:
-            # Check if the transaction involves our address
-            if tx['from'].lower() == address or (tx.get('to') and tx['to'].lower() == address):
-                result.append(tx)
-                
-        print(f"Processed block {block_number} - Found {len(result)} transactions")
-        
-        # Convert Web3 objects to dictionaries to make them serializable
-        serializable_txs = []
-        for tx in result:
-            tx_dict = dict(tx)
-            # Convert any non-serializable objects
-            for k, v in tx_dict.items():
-                if isinstance(v, (bytes, bytearray)):
-                    tx_dict[k] = v.hex()
-            serializable_txs.append(tx_dict)
+    for attempt in range(max_retries):
+        try:
+            block = local_w3.eth.get_block(block_number, full_transactions=True)
+            result = []
             
-        return serializable_txs
-    except Exception as e:
-        print(f"Error processing block {block_number}: {e}")
-        return []
+            for tx in block.transactions:
+                # Check if the transaction involves our address
+                if tx['from'].lower() == address or (tx.get('to') and tx['to'].lower() == address):
+                    result.append(tx)
+                    
+            print(f"Processed block {block_number} - Found {len(result)} transactions")
+            
+            # Convert Web3 objects to dictionaries to make them serializable
+            serializable_txs = []
+            for tx in result:
+                tx_dict = dict(tx)
+                # Convert any non-serializable objects
+                for k, v in tx_dict.items():
+                    if isinstance(v, (bytes, bytearray)):
+                        tx_dict[k] = v.hex()
+                serializable_txs.append(tx_dict)
+                
+            return serializable_txs # Success, exit retry loop
+            
+        except requests.exceptions.HTTPError as http_err:
+            if http_err.response.status_code == 429:
+                print(f"Rate limit (429) hit processing block {block_number}. Retrying in {retry_delay}s... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(retry_delay)
+                retry_delay *= 2 # Basic exponential backoff
+            else:
+                # Handle other HTTP errors
+                print(f"HTTP Error processing block {block_number}: {http_err}")
+                return [] # Non-recoverable HTTP error for this block
+        except Exception as e:
+            # Handle other unexpected errors
+            print(f"Unexpected Error processing block {block_number}: {e}")
+            return [] # Non-recoverable error for this block
+            
+    # If all retries fail
+    print(f"Failed to process block {block_number} after {max_retries} retries due to rate limiting.")
+    return []
 
 def get_transaction_history(address, start_block=0, end_block=None, num_workers=None, batch_size=50, use_gpu=False):
     """
@@ -144,10 +174,15 @@ def get_transaction_history(address, start_block=0, end_block=None, num_workers=
     print(f"Searching from block {start_block} to {end_block} using PyTorch parallel processing...")
     print(f"Using {num_workers} workers")
     
-    # Limit blocks to check for demo purposes
-    blocks_to_check = min(1000, end_block - start_block)
-    block_range = list(range(end_block, end_block - blocks_to_check, -1))
-    block_range = [b for b in block_range if b >= start_block]
+    # Use the full block range derived from dates (or defaults)
+    if start_block > end_block:
+        print(f"Warning: Start block {start_block} is after end block {end_block}. No blocks to scan.")
+        block_range = []
+    else:
+        # Range goes from end_block down to start_block (inclusive)
+        block_range = list(range(end_block, start_block - 1, -1))
+    
+    block_range = [b for b in block_range if b >= start_block] # Keep this safety check
     
     # Split blocks into batches
     batches = [block_range[i:i + batch_size] for i in range(0, len(block_range), batch_size)]
@@ -199,42 +234,140 @@ def get_transactions_etherscan(address, start_date=None, end_date=None):
     Note: You'll need to get an Etherscan API key and add it to your .env file
     """
     try:
-        import requests
-        
         etherscan_api_key = os.getenv("ETHERSCAN_API_KEY")
         if not etherscan_api_key:
             print("No Etherscan API key found. Using direct blockchain scanning instead.")
             return None
+        
+        # Ensure the address is in the correct format (with 0x prefix and checksum format)
+        try:
+            # Attempt to checksum the address
+            address = Web3.to_checksum_address(address)
+        except ValueError:
+            # If checksumming fails, just ensure it has 0x prefix
+            if not address.startswith('0x'):
+                address = '0x' + address
         
         # Convert dates to timestamps if provided
         start_timestamp = int(start_date.timestamp()) if start_date else 0
         end_timestamp = int(end_date.timestamp()) if end_date else int(datetime.datetime.now(datetime.timezone.utc).timestamp())
         
         print(f"Searching for transactions from {start_date} to {end_date if end_date else 'now'}")
+        
+        # Prepare parameters for outgoing transactions query
+        params = {
+            'module': 'account',
+            'action': 'txlist',
+            'address': address,
+            'startblock': '0',
+            'endblock': '99999999',
+            'sort': 'desc',
+            'apikey': etherscan_api_key
+        }
+        
+        # Add optional timestamp parameters if dates are provided
+        if start_date:
+            params['starttime'] = str(int(start_timestamp))
+        if end_date:
+            params['endtime'] = str(int(end_timestamp))
             
-        # Get transactions where address is the sender
-        url = f"https://api.etherscan.io/api?module=account&action=txlist&address={address}&startblock=0&endblock=99999999&sort=desc&apikey={etherscan_api_key}"
-        response = requests.get(url)
-        outgoing_txs = response.json().get('result', []) if response.status_code == 200 else []
+        # Get transactions where address is the sender with error handling
+        outgoing_txs = []
+        try:
+            url = "https://api.etherscan.io/api"
+            response = requests.get(url, params=params)
+            
+            if response.status_code != 200:
+                print(f"Error from Etherscan API (status {response.status_code}): {response.text}")
+            else:
+                result = response.json()
+                if result.get('status') == '1':
+                    outgoing_txs = result.get('result', [])
+                else:
+                    print(f"Etherscan API error: {result.get('message', 'Unknown error')}")
+                    # If we hit rate limits, pause briefly
+                    if 'rate limit' in result.get('message', '').lower():
+                        print("Rate limit hit, pausing for 5 seconds...")
+                        time.sleep(5)
+        except Exception as e:
+            print(f"Error fetching outgoing transactions: {e}")
         
         # Get transactions where address is the receiver
-        url = f"https://api.etherscan.io/api?module=account&action=txlistinternal&address={address}&startblock=0&endblock=99999999&sort=desc&apikey={etherscan_api_key}"
-        response = requests.get(url)
-        incoming_txs = response.json().get('result', []) if response.status_code == 200 else []
+        # For internal transactions (contract calls)
+        params['action'] = 'txlistinternal'
         
-        # Combine and filter by date if needed
-        all_txs = outgoing_txs + incoming_txs
+        # Reset the timestamps as they might not be supported for internal transactions
+        if 'starttime' in params:
+            del params['starttime']
+        if 'endtime' in params:
+            del params['endtime']
+            
+        incoming_txs = []
+        try:
+            response = requests.get(url, params=params)
+            
+            if response.status_code != 200:
+                print(f"Error from Etherscan API for internal txs (status {response.status_code}): {response.text}")
+            else:
+                result = response.json()
+                if result.get('status') == '1':
+                    internal_txs = result.get('result', [])
+                    
+                    # Filter by date if needed
+                    if start_date or end_date:
+                        incoming_txs = [
+                            tx for tx in internal_txs 
+                            if int(tx.get('timeStamp', 0)) >= start_timestamp and 
+                               int(tx.get('timeStamp', 0)) <= end_timestamp
+                        ]
+                    else:
+                        incoming_txs = internal_txs
+                else:
+                    print(f"Etherscan API error for internal txs: {result.get('message', 'Unknown error')}")
+        except Exception as e:
+            print(f"Error fetching internal transactions: {e}")
         
-        if start_date or end_date:
-            filtered_txs = []
-            for tx in all_txs:
-                # Convert transaction timestamp to datetime
-                tx_timestamp = int(tx.get('timeStamp', 0))
-                if tx_timestamp >= start_timestamp and tx_timestamp <= end_timestamp:
-                    filtered_txs.append(tx)
-            return filtered_txs
+        # Also get ERC-20 token transfers if we didn't hit any rate limits
+        token_txs = []
+        try:
+            params['action'] = 'tokentx'
+            response = requests.get(url, params=params)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('status') == '1':
+                    all_token_txs = result.get('result', [])
+                    
+                    # Filter by date if needed
+                    if start_date or end_date:
+                        token_txs = [
+                            tx for tx in all_token_txs 
+                            if int(tx.get('timeStamp', 0)) >= start_timestamp and 
+                               int(tx.get('timeStamp', 0)) <= end_timestamp
+                        ]
+                    else:
+                        token_txs = all_token_txs
+        except Exception as e:
+            print(f"Error fetching token transactions (non-critical): {e}")
         
-        return all_txs
+        # Combine all transaction types
+        all_txs = outgoing_txs + incoming_txs + token_txs
+        
+        # If we got results, return them
+        if all_txs:
+            # Mark the transaction type
+            for tx in outgoing_txs:
+                tx['tx_type'] = 'normal'
+            for tx in incoming_txs:
+                tx['tx_type'] = 'internal'
+            for tx in token_txs:
+                tx['tx_type'] = 'token'
+                
+            return all_txs
+        else:
+            print("No transactions found via Etherscan or API error occurred.")
+            return None
+            
     except ImportError:
         print("Requests library not installed. Using direct blockchain scanning instead.")
         return None
@@ -257,6 +390,8 @@ def parse_arguments():
                         help='Number of blocks to process in each batch')
     parser.add_argument('--use-gpu', action='store_true',
                         help='Use GPU acceleration if available')
+    parser.add_argument('--skip-etherscan', action='store_true',
+                        help='Skip Etherscan API and use direct blockchain scanning')
     return parser.parse_args()
 
 def main():
@@ -278,10 +413,12 @@ def main():
     if end_date:
         print(f"End date: {end_date} (estimated block: {end_block})")
     
-    # Try Etherscan API first (more efficient)
-    etherscan_txs = get_transactions_etherscan(address, start_date, end_date)
+    # Try Etherscan API first (more efficient) unless skipped
+    etherscan_txs = None
+    if not args.skip_etherscan:
+        etherscan_txs = get_transactions_etherscan(address, start_date, end_date)
     
-    output_filename = f"{address.lower()}_transactions"
+    output_filename = f"{address.lower().replace('0x', '')}_transactions"
     if start_date:
         output_filename += f"_from_{args.start_date}"
     if end_date:
@@ -301,9 +438,17 @@ def main():
             print(f"Transaction {i+1}:")
             print(f"  Hash: {tx.get('hash', tx.get('blockHash', 'N/A'))}")
             print(f"  Date: {tx_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            print(f"  Type: {tx.get('tx_type', 'normal')}")
             print(f"  From: {tx.get('from', 'N/A')}")
             print(f"  To: {tx.get('to', 'N/A')}")
-            print(f"  Value: {float(tx.get('value', 0)) / 10**18} ETH")
+            
+            # Handle value display differently for token transactions
+            if tx.get('tx_type') == 'token':
+                token_value = float(tx.get('value', 0)) / (10 ** int(tx.get('tokenDecimal', 18)))
+                print(f"  Value: {token_value} {tx.get('tokenSymbol', 'tokens')}")
+            else:
+                print(f"  Value: {float(tx.get('value', 0)) / 10**18} ETH")
+                
             print(f"  Block: {tx.get('blockNumber', 'N/A')}")
             print("")
         
